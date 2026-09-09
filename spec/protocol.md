@@ -178,5 +178,9 @@ analog routes as §6, and cleans up on client loss.
 ## Open items
 
 - Wire format for `hello`/`welcome` fields is illustrative until the reference host lands.
-- `cross_kind_routes` thresholds (analog→digital at 1.0 V? hysteresis?) — define when needed.
+- `cross_kind_routes` conversion rule. Proposal: analog→digital is a Schmitt trigger, high
+  at ≥ 1.0 V, low at < 0.5 V (the common Eurorack trigger convention); digital→analog emits
+  0 V / 5 V. The Patch SM datasheet gives its gate input only as "0 to 5 V typical" with no
+  switching threshold (`patch-sm-ds v1.0.5` pdf p. 7), so the real comparator threshold is
+  unmeasured. Decision pending: measure on the bench first, or ship the convention.
 - Multi-host on one machine: session-scoped socket paths are sufficient; not specified further.
