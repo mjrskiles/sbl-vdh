@@ -19,6 +19,10 @@ host's and happens once. Clients never convert.
 
 This mirrors virtio's basic facilities (virtio v1.2 §2, p. 21): a status sequence, feature
 bits, a configuration space with a generation counter, notifications, and typed queues.
+The transport is the one QEMU's vhost-user protocol uses between a VM and a userspace
+device backend — a Unix socket for control, memory regions passed as file descriptors
+via `SCM_RIGHTS`, eventfds as kick/call doorbells, feature negotiation — with no VM and
+no virtqueues (https://qemu.readthedocs.io/en/master/interop/vhost-user.html).
 
 ## 2. Discovery and handshake
 
@@ -50,6 +54,9 @@ either → other  bye      {reason}
 Region memory is `memfd`-backed. Lifetime is fd lifetime: when either side dies, the
 kernel closes its fds and the other side observes it (`recv` returns 0 on the control
 socket; `read` on the doorbell fails). No named `/dev/shm` objects, nothing to clean up.
+The host MUST apply `F_SEAL_SHRINK | F_SEAL_GROW` to every region memfd before sending it,
+so no client can resize a region under the host; a client MAY verify the seals with
+`F_GET_SEALS` and treat their absence as a protocol error.
 
 ## 3. Region header
 
@@ -98,7 +105,15 @@ block of `channel_count * block_size` interleaved `int32` samples; `capacity` is
 the clock (§5). For MIDI an element is one byte; `capacity` is at least 1024. Producer
 writes then publishes `head` (release); consumer reads then publishes `tail` (release);
 both acquire the other's cursor. A full ring is a producer error the host logs (audio:
-xrun; MIDI: overflow) — data is never silently overwritten.
+xrun; MIDI: overflow) — data is never silently overwritten. Cursors are shared memory the
+other side wrote: both sides MUST reduce `head` and `tail` modulo `capacity` before
+indexing and MUST NOT trust a cursor delta larger than `capacity` (treat it as a
+protocol error). Seals stop a resize; nothing but this rule stops a bad cursor.
+
+State regions are written element by element. In offline mode the host writes all state
+routes before ticking, so an app never observes a partial update. In realtime mode a
+multi-channel write can interleave with an app read, exactly as a DMA scan does on
+hardware; this is intended, and `seq` exists for the readers that need better.
 
 Audio sample format is **`s24_rj_i32`**: 24-bit two's complement, right-aligned in an
 `int32`, upper byte not sign-extended (`sound-byte-libs/src/sbl/dsp/types/convert.hpp`).
@@ -119,9 +134,17 @@ The host is the clock master. Each client gets two eventfds: `tick` (host → cl
 
 A client's audio driver, in attached mode, opens no device. It blocks on `tick`, pulls one
 block from `AUDIO_IN`, runs the app callback, pushes to `AUDIO_OUT`, writes 1 to `done`.
-Latency is one block per hop and deterministic. Clients that do not do audio still receive
-`tick` and MUST NOT need to answer it (the host waits only on clients that declared audio
-ports).
+Latency is one block per hop and deterministic: a chain of four apps at 48-frame blocks
+adds 4 ms end to end, which JACK and PipeWire (whole graph inside one period) would not.
+That is the price of exactly-one-block feedback semantics and is deliberate. Clients that
+do not do audio still receive `tick` and MUST NOT need to answer it (the host waits only
+on clients that declared audio ports).
+
+An eventfd accumulates writes. A client that reads a `tick` value greater than 1 has
+missed ticks: it MUST run exactly one block, count the remainder as xruns, and log them.
+It MUST NOT run the missed blocks late. The thread that waits on `tick` SHOULD run with
+the same real-time scheduling the standalone audio thread uses (SCHED_FIFO below the
+system audio server's priority, memory locked); without it a busy host starves the app.
 
 **Modes.** `realtime`: ticks come from the physical device callback. `offline` (feature
 `offline_clock`): the host ticks as fast as the slowest client completes, for a requested
@@ -166,6 +189,9 @@ no equivalent; their record is `constexpr`.
   status. Continuing with frozen inputs is not permitted (RPT-031 §F7).
 - **Protocol error** (bad magic, version mismatch, unknown kind required). Whoever detects
   it sends `bye {reason}` and closes.
+- **Liveness beyond fds.** The host MAY hold a `pidfd` for every attached app (works
+  whether or not the host spawned it) and MAY set `PR_SET_PDEATHSIG` on apps it spawns.
+  Neither replaces the fd-lifetime rules above; they shorten detection.
 
 ## 9. Conformance
 
@@ -184,3 +210,15 @@ analog routes as §6, and cleans up on client loss.
   switching threshold (`patch-sm-ds v1.0.5` pdf p. 7), so the real comparator threshold is
   unmeasured. Decision pending: measure on the bench first, or ship the convention.
 - Multi-host on one machine: session-scoped socket paths are sufficient; not specified further.
+- **A stopped client in realtime mode** (a debugger holds it). The host skips its block
+  and logs; what do its consumers hear meanwhile? Proposal: silence. A halted MCU's codec
+  keeps clocking the last DMA buffer, so "repeat the last block" is the hardware-literal
+  answer, but silence is the one nobody mistakes for a working app.
+- **Control channel encoding.** §2 says newline JSON, chosen for debuggability; the
+  `linux-arm-host` client must then parse `welcome` in C++, which puts a JSON parser in a
+  driver. Proposal: fixed-size binary structs for `hello`/`welcome`/`ready`/`bye` with a
+  versioned header, in the style of vhost-user and of `sbl_vdh_region_hdr`; the region
+  list rides as one struct per region ahead of the fds. Python reads them with `struct`,
+  the C++ client with a cast, and JSON stays where both ends are Python (route and patch
+  commands between sidecar and the host). The alternative is a header-only parser
+  (nlohmann/json, MIT) confined to the host driver. Decision pending.
