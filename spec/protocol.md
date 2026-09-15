@@ -1,7 +1,16 @@
 # VDH protocol — v0 (draft)
 
-Status: draft, 2026-09-09. Derived from RPT-031 (sound-byte-labs) findings F3–F8, all
-accepted. Nothing here is implemented yet.
+Status: draft, 2026-09-09; proposals for the v0 review added 2026-09-15. Derived from
+RPT-031 (sound-byte-labs) findings F3–F8, all accepted. Nothing here is implemented yet.
+
+> **Review guide (AP-039 Phase 2).** Blocks marked *Proposal* are Claude's, written from
+> what building the bench needed (FDP-079); each is a decision for Michael. In order of
+> consequence: (1) §2 the control-channel encoding — binary structs for the handshake, JSON
+> for operators; (2) §6 per-route gain and the fan-in rule, which make the host most of a
+> mixer; (3) §10 the operator API sidecar's daemon and any front end need; (4) §6 the
+> cross-kind route rule, already decided on the bench and moved out of the open items;
+> (5) §2 how a bench names its host. Accepting a proposal means deleting the word
+> *Proposal* from it; rejecting one means saying what instead.
 
 ## 1. Model
 
@@ -28,9 +37,38 @@ no virtqueues (https://qemu.readthedocs.io/en/master/interop/vhost-user.html).
 
 - `SBL_VDH=<path>` — a Unix domain socket the host listens on. Absent → the client runs
   standalone and this document does not apply.
-- The **control channel** is that socket: newline-delimited JSON messages, with file
-  descriptors passed via `SCM_RIGHTS` where noted. JSON is chosen for debuggability; the
-  data path never touches it.
+- The **control channel** is that socket, with file descriptors passed via `SCM_RIGHTS`
+  where noted. The data path never touches it.
+
+*Proposal (2026-09-15) — encoding.* Two peers, two encodings, by role. **Clients**
+(drivers inside apps) speak fixed-size, little-endian binary structs with a common
+header, so the C++ driver parses `welcome` with a cast and no JSON parser lives in a
+driver (RPT-031 §F5's rule); Python reads them with `struct`. **Operators** (sidecar, a
+front end, a test) speak newline-delimited JSON on the same socket (§10). The first bytes
+decide: a client's first message is the binary `hello` whose header begins `"SBLV"`; an
+operator's first line begins `{`. Every binary message:
+
+```c
+struct sbl_vdh_msg_hdr { char magic[4]; /* "SBLV" */ uint16_t version; /* 0 */ uint16_t type; uint32_t length; /* bytes after the header */ };
+// type 1 hello:    { uint32_t proto; uint32_t features; uint32_t pid; char app[32]; uint8_t shim_sha256[32]; }
+// type 2 welcome:  { uint32_t proto; uint32_t features; uint32_t region_count; uint32_t doorbell_count; }
+//                  followed by region_count × { uint32_t kind; uint32_t fd_index; uint32_t size; uint32_t port_count; char ports[port_count][32]; }
+//                  with the fds (regions, then tick, done) attached to this message
+// type 3 ready:    {}
+// type 4 bye:      { char reason[64]; }
+// type 5 port_config: { char port[32]; float lo_v, hi_v; uint16_t bits; uint8_t inverted; float idle_v; }
+```
+
+Features are a bit set in this encoding (§2 lists them by name in feature-bit order:
+`offline_clock` = bit 0, `port_config` = 1, `midi_out` = 2, `cross_kind_routes` = 3,
+`midi_channel_filter` = 4). A host that does not recognise the magic closes the socket.
+
+*Proposal (2026-09-15) — naming a host.* `SBL_VDH` is the whole of discovery. Whoever
+starts apps (sidecar, a script, a shell) sets it in their environment; a bench that
+names its own host install points `SBL_VDH` at that host's socket and nothing else
+changes. The host announces nothing, registers nowhere, and there is one host per
+socket path. Session-scoped paths (`$XDG_RUNTIME_DIR/sbl-vdh/<bench>.sock`) are a
+convention of the operator, not of this protocol.
 
 Sequence (client states in brackets, after virtio's status field):
 
@@ -45,8 +83,9 @@ either → other  bye      {reason}
 
 - `shim_sha256` is the hash of the SHIM the app was built with. The host already has the
   SHIM (from launch or from `attach --shim`); a mismatch is a hard `bye`.
-- `features` are strings. v0 defines: `offline_clock`, `port_config`, `midi_out`,
-  `cross_kind_routes`. A client MUST NOT use a feature the host did not ack.
+- `features` are strings (bits in the binary encoding). v0 defines: `offline_clock`,
+  `port_config`, `midi_out`, `cross_kind_routes`, and — *Proposal (2026-09-15)* —
+  `midi_channel_filter` (§6). A client MUST NOT use a feature the host did not ack.
 - Each `regions[]` entry: `{kind, ports: [id...], fd_index, size}`. Kinds are listed in §4.
   A client MUST accept regions in any order and MAY ignore kinds it does not drive.
 - The host MUST NOT tick a client before `ready` (virtio: no buffers before `DRIVER_OK`).
@@ -149,7 +188,9 @@ system audio server's priority, memory locked); without it a busy host starves t
 **Modes.** `realtime`: ticks come from the physical device callback. `offline` (feature
 `offline_clock`): the host ticks as fast as the slowest client completes, for a requested
 number of blocks; there is no wall-clock timeout. Offline mode is what makes bit-exact
-golden renders possible.
+golden renders possible. The reference host does both (Michael, AP-039 Q1, 2026-09-14):
+it owns the physical interface in realtime mode, through an audio library it declares as
+a dependency, and needs none offline.
 
 **Timeouts.** In realtime mode the host MUST NOT block the device callback on a slow
 client; it skips the client's block (logging an xrun) and continues. A client waiting on
@@ -170,6 +211,31 @@ Analog conversion per copy: `v = decode(src_code, src.electrical)`,
 `dst_code = encode(clamp(v, dst.range), dst.electrical)`, where `decode`/`encode` use
 `range_v`, `bits`, and `inverted` from the SHIMs. Digital and MIDI are copied unchanged.
 Fan-out is always allowed. An unpatched input holds its SHIM `idle_v`, encoded.
+
+*Proposal (2026-09-15) — gain and fan-in* (`sketchbook/bench-mixing.md`: "where is the
+mixing board?"). A route carries a `gain` (linear, default 1.0) and, for MIDI, an
+optional `channel` (1–16). The rules by kind:
+
+| Kind | Gain | Fan-in (several routes into one input) |
+|---|---|---|
+| audio | applied per copy, in float before `s24_rj_i32` | **summed** after gain, in float, then converted and clipped at the destination's full scale; the host logs a clip once per second per input |
+| analog | applied in volts before `encode` | **refused**: two CV outputs into one jack is a short on hardware; a bench that wants a sum patches a mixer app |
+| digital | none | **refused** for the same reason (an OR would be a rule the hardware does not have) |
+| midi | none | **merged**, whole messages only, running status written out per source — what sidecar's virmidi bus does today |
+
+The `midi_channel_filter` feature: a MIDI route with a `channel` passes only messages
+on that channel (System messages pass), so one output can fan out to four voices by
+channel — the bench's channel bus, moved into the host as an optional feature bit
+(Michael, AP-039 Q2). A host without the bit rejects a `channel` on `patch`, and
+sidecar keeps its own bus for that host. With audio gain and summing the host is a
+mixer without sends; sends and returns are a Mixer app's business, not the host's.
+
+*Cross-kind routes* (feature `cross_kind_routes`; decided on the bench, Michael
+2026-09-10, no longer open): analog→digital is a Schmitt trigger, high at ≥ 1.0 V, low
+at < 0.5 V (the common Eurorack trigger convention); digital→analog emits 0 V for low and
+5 V for high, then `encode` at the destination. The Patch SM's real comparator threshold
+is unmeasured (`patch-sm-ds v1.0.5` p. 7 says only "0 to 5 V typical"); the convention
+ships and gets fixed only if it proves a problem.
 
 ## 7. Runtime port configuration (feature `port_config`)
 
@@ -201,24 +267,39 @@ audio, never writes into a full ring, and exits nonzero on host loss. A host is 
 if it never ticks before `ready`, never blocks its device callback on a client, converts
 analog routes as §6, and cleans up on client loss.
 
+## 10. Operator API — *Proposal (2026-09-15)*
+
+A host without an operator is a rack with no hands. Sidecar's daemon (FDP-079 Phase 5),
+a web front end (Phase 6) and a test fixture all need the same few verbs, so they are
+part of the protocol rather than of any one host. Operators connect to the same socket
+and speak newline-delimited JSON: one request line, one response line (`{ok: true, ...}`
+or `{ok: false, error}`), and after `subscribe`, event lines as they happen. The host
+serves any number of operators; it does not spawn apps (Michael, FDP-079 markup) and
+knows nothing about how they were started.
+
+| Request | Response | Meaning |
+|---|---|---|
+| `{op: "list"}` | `{apps: [{name, pid, state, ports: [{id, kind, ...from the SHIM}]}], routes: [{src, dst, gain, channel}]}` | the rack as it stands |
+| `{op: "patch", src: "maestro.midi_out", dst: "voice1.midi_in", gain?, channel?}` | `{ok}` | a route, validated as §6 |
+| `{op: "unpatch", src, dst}` | `{ok}` | |
+| `{op: "status"}` | `{mode, block_size, sample_rate, blocks, xruns: {app: n}, overflows: {app: n}, routes: [{src, dst, bytes, messages}]}` | the numbers the dashboard draws |
+| `{op: "read", app, port}` | `{value}` | one state port's current value, decoded to volts or 0/1: the dashboard's real gauges |
+| `{op: "subscribe"}` | events until the socket closes | `{event: "attached"\|"detached"\|"xrun"\|"patched"\|"unpatched"\|"clip", ...}` |
+| `{op: "record", ports: ["voice1.audio_out", ...], path, blocks?}` | `{ok, take}` | the host writes those ports' blocks to one file per port from the next tick, until `blocks` or `{op: "stop", take}`; the files line up to the sample by construction |
+| `{op: "run", blocks}` | `{ok}` after the last block | offline mode only: tick `blocks` blocks |
+| `{op: "quit"}` | `{ok}` | the host says `bye` to every client and exits |
+
+Ports are named `app.port` with the SHIM's port ids (`spec/shim.md`), which is also the
+route vocabulary in sidecar's session files. `read` and `record` give a bench everything
+the virmidi taps and the PipeWire recorder gave it, from the host's own buffers.
+
 ## Open items
 
-- Wire format for `hello`/`welcome` fields is illustrative until the reference host lands.
-- `cross_kind_routes` conversion rule. Proposal: analog→digital is a Schmitt trigger, high
-  at ≥ 1.0 V, low at < 0.5 V (the common Eurorack trigger convention); digital→analog emits
-  0 V / 5 V. The Patch SM datasheet gives its gate input only as "0 to 5 V typical" with no
-  switching threshold (`patch-sm-ds v1.0.5` pdf p. 7), so the real comparator threshold is
-  unmeasured. Decision pending: measure on the bench first, or ship the convention.
 - Multi-host on one machine: session-scoped socket paths are sufficient; not specified further.
 - **A stopped client in realtime mode** (a debugger holds it). The host skips its block
   and logs; what do its consumers hear meanwhile? Proposal: silence. A halted MCU's codec
   keeps clocking the last DMA buffer, so "repeat the last block" is the hardware-literal
   answer, but silence is the one nobody mistakes for a working app.
-- **Control channel encoding.** §2 says newline JSON, chosen for debuggability; the
-  `linux-arm-host` client must then parse `welcome` in C++, which puts a JSON parser in a
-  driver. Proposal: fixed-size binary structs for `hello`/`welcome`/`ready`/`bye` with a
-  versioned header, in the style of vhost-user and of `sbl_vdh_region_hdr`; the region
-  list rides as one struct per region ahead of the fds. Python reads them with `struct`,
-  the C++ client with a cast, and JSON stays where both ends are Python (route and patch
-  commands between sidecar and the host). The alternative is a header-only parser
-  (nlohmann/json, MIT) confined to the host driver. Decision pending.
+- **Control channel encoding.** Now a proposal in §2 (binary for clients, JSON for
+  operators). The alternative — a header-only JSON parser confined to the host driver —
+  stays on the table if the struct route reads badly.
