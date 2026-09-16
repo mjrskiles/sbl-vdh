@@ -28,7 +28,7 @@ enum sbl_vdh_kind {
 };
 
 struct sbl_vdh_region_hdr {
-    char               magic[4];
+    char               signature[4];
     uint32_t           version;
     uint32_t           kind;
     uint32_t           flags;

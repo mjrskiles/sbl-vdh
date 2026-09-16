@@ -5,20 +5,23 @@ RPT-031 (sound-byte-labs) findings F3–F8, all accepted. Nothing here is implem
 
 > **Review guide (AP-039 Phase 2).** Blocks marked *Proposal* are Claude's, written from
 > what building the bench needed (FDP-079); each is a decision for Michael. In order of
-> consequence: (1) §2 the control-channel encoding — binary structs for the handshake, JSON
-> for operators; (2) §6 per-route gain and the fan-in rule, which make the host most of a
-> mixer; (3) §10 the operator API sidecar's daemon and any front end need; (4) §6 the
-> cross-kind route rule, already decided on the bench and moved out of the open items;
-> (5) §2 how a bench names its host. Accepting a proposal means deleting the word
-> *Proposal* from it; rejecting one means saying what instead.
+> consequence: (1) §2 attached only — no standalone driver path (answers the review's
+> question); (2) §5 the pipelined schedule (answers "why the one-block delay"); (3) §2 the
+> control-channel encoding — binary structs for the handshake, JSON for operators;
+> (4) §10 the operator API sidecar's daemon and any front end need; (5) §2 how a bench
+> names its host. Folded from the first review (2026-09-15): the host never spawns, the
+> host never mixes (§6, fan-in refused for audio; a Mixer app sums), `signature` not
+> `signature`, a stopped client's consumers hear silence. Accepting a proposal means deleting
+> the word *Proposal* from it; rejecting one means saying what instead.
 
 ## 1. Model
 
 A **host** owns the physical audio and MIDI devices (or runs with none, offline), a set of
 shared-memory **regions** per attached app, a **routing table**, and the **clock**. A
 **client** is one of the `linux-arm-host` drivers inside an app process. An app attaches by
-having `SBL_VDH` in its environment when its drivers initialize; the host may have spawned
-it or not (a debugger may have).
+having `SBL_VDH` in its environment when its drivers initialize. The host never spawns
+apps (Michael, FDP-079 markup): whoever starts an app — sidecar, a shell, a debugger —
+sets the variable, and the host learns of the app when it connects.
 
 Regions hold **device codes** — what the driver would see from real hardware: `uint16`
 ADC counts, `0/1` pin states, 24-bit audio in `int32`, MIDI bytes. The host converts between
@@ -35,8 +38,22 @@ no virtqueues (https://qemu.readthedocs.io/en/master/interop/vhost-user.html).
 
 ## 2. Discovery and handshake
 
-- `SBL_VDH=<path>` — a Unix domain socket the host listens on. Absent → the client runs
-  standalone and this document does not apply.
+- `SBL_VDH=<path>` — a Unix domain socket the host listens on.
+
+*Proposal (2026-09-15, answering the review's question "what are the downsides of
+requiring a VDH?") — attached only.* Today every `linux-arm-host` driver has a standalone
+path (miniaudio, rawmidi, idle counts) and would gain an attached one: two paths in four
+drivers, forever, and the kind of drift the golden render exists to catch. Requiring the
+host removes the standalone path entirely: the drivers do one thing, miniaudio and
+rawmidi move into the host (which needs them for real-time mode anyway), and
+`usb_stubs.cpp`'s rawmidi bridge is deleted rather than kept beside its replacement.
+The downsides are real but small: nothing runs on Linux until the host exists, so the
+client drivers and the reference host land in one phase and the bench stays on virmidi
+until they do; the quick check (`SBL_AUDIO_DEVICE=H5studio ./davis_jr`) becomes
+`vdh --solo ./davis_jr`, a host that patches one app's audio and MIDI straight to the
+interface, which is what `sidecar new -a` already means; and CI always needs the host,
+which it needs for the render regardless. Under this proposal an app with `SBL_VDH`
+unset logs one line and exits nonzero, the same rule as a host that goes away (§8).
 - The **control channel** is that socket, with file descriptors passed via `SCM_RIGHTS`
   where noted. The data path never touches it.
 
@@ -49,7 +66,7 @@ decide: a client's first message is the binary `hello` whose header begins `"SBL
 operator's first line begins `{`. Every binary message:
 
 ```c
-struct sbl_vdh_msg_hdr { char magic[4]; /* "SBLV" */ uint16_t version; /* 0 */ uint16_t type; uint32_t length; /* bytes after the header */ };
+struct sbl_vdh_msg_hdr { char signature[4]; /* "SBLV" */ uint16_t version; /* 0 */ uint16_t type; uint32_t length; /* bytes after the header */ };
 // type 1 hello:    { uint32_t proto; uint32_t features; uint32_t pid; char app[32]; uint8_t shim_sha256[32]; }
 // type 2 welcome:  { uint32_t proto; uint32_t features; uint32_t region_count; uint32_t doorbell_count; }
 //                  followed by region_count × { uint32_t kind; uint32_t fd_index; uint32_t size; uint32_t port_count; char ports[port_count][32]; }
@@ -61,7 +78,7 @@ struct sbl_vdh_msg_hdr { char magic[4]; /* "SBLV" */ uint16_t version; /* 0 */ u
 
 Features are a bit set in this encoding (§2 lists them by name in feature-bit order:
 `offline_clock` = bit 0, `port_config` = 1, `midi_out` = 2, `cross_kind_routes` = 3,
-`midi_channel_filter` = 4). A host that does not recognise the magic closes the socket.
+`midi_channel_filter` = 4). A host that does not recognise the signature closes the socket.
 
 *Proposal (2026-09-15) — naming a host.* `SBL_VDH` is the whole of discovery. Whoever
 starts apps (sidecar, a script, a shell) sets it in their environment; a bench that
@@ -103,7 +120,7 @@ Every region starts with a 64-byte header (`include/sbl_vdh/regions.h`):
 
 ```c
 struct sbl_vdh_region_hdr {
-    char     magic[4];        // "SBLV"
+    char     signature[4];    // "SBLV"
     uint32_t version;         // header layout version, 0 for this draft
     uint32_t kind;            // SBL_VDH_KIND_*
     uint32_t flags;
@@ -122,7 +139,7 @@ struct sbl_vdh_region_hdr {
 ```
 
 Sizes are in the header so one layout serves every kind and a Python reader needs no
-per-kind struct. Readers MUST check `magic`, `version`, and that `size >= data_offset +
+per-kind struct. Readers MUST check `signature`, `version`, and that `size >= data_offset +
 capacity*stride`.
 
 ## 4. Region kinds and semantics
@@ -162,22 +179,34 @@ MSB-justified serial frame (RM0433 Rev 8 §51.4.5, p. 2242).
 ## 5. Clock and doorbell
 
 The host is the clock master. Each client gets two eventfds: `tick` (host → client) and
-`done` (client → host). Per block the host:
+`done` (client → host).
 
-1. Copies state routes (ADC/GPIO/DAC) for all apps.
-2. Walks apps in **route order** (topological over audio/MIDI routes; cycles are broken by
-   treating the back edge as one block late). For each app: write its `AUDIO_IN` block,
-   write 1 to `tick`, wait for `done`, then copy its `AUDIO_OUT` along its routes.
-3. Delivers the final mix to the physical device (real-time mode) or discards/records it
-   (offline mode).
+*Proposal (2026-09-15, answering the review's question "what is the reason for the one
+block delay?").* The earlier text described two different schedules at once. A **serial
+walk** — tick app A, wait, copy its output to B, tick B, wait — adds no latency along a
+forward route but runs the apps one after another, so the sum of every app's block time
+must fit one period: four Davis Jr. voices at ~37 % of a core each cannot. A
+**pipelined** schedule ticks every app at once, each consuming what its sources produced
+on the previous block: apps run in parallel on separate cores, the host's work per block
+is copies only, and every hop costs exactly one block of latency (1 ms at 48 frames, a
+chain of four adds 4 ms), which JACK and PipeWire avoid by running the whole graph inside
+one period but which is what makes the schedule deterministic with no ordering rule at
+all. The one-block delay is the price of running five apps on four cores in real time
+and of a render that is bit-exact whatever the machine. The proposal is the pipelined
+schedule, and the walk becomes:
 
-A client's audio driver, in attached mode, opens no device. It blocks on `tick`, pulls one
-block from `AUDIO_IN`, runs the app callback, pushes to `AUDIO_OUT`, writes 1 to `done`.
-Latency is one block per hop and deterministic: a chain of four apps at 48-frame blocks
-adds 4 ms end to end, which JACK and PipeWire (whole graph inside one period) would not.
-That is the price of exactly-one-block feedback semantics and is deliberate. Clients that
-do not do audio still receive `tick` and MUST NOT need to answer it (the host waits only
-on clients that declared audio ports).
+1. Copy every route — state (ADC/GPIO/DAC) and stream (audio, MIDI) — from what each
+   source published for the previous block. Fan-in and conversion are §6.
+2. Write 1 to every audio client's `tick`; wait for every `done` (realtime: or the
+   deadline, §Timeouts).
+3. Deliver the physical output ports' blocks to the device (real-time mode) or discard
+   or record them (offline mode).
+
+A client's audio driver opens no device. It blocks on `tick`, pulls one block from
+`AUDIO_IN`, runs the app callback, pushes to `AUDIO_OUT`, writes 1 to `done`. Clients
+that do not do audio still receive `tick` and MUST NOT need to answer it (the host waits
+only on clients that declared audio ports). Route order no longer exists: a cycle is
+just a route like any other, one block late by construction.
 
 An eventfd accumulates writes. A client that reads a `tick` value greater than 1 has
 missed ticks: it MUST run exactly one block, count the remainder as xruns, and log them.
@@ -193,8 +222,11 @@ it owns the physical interface in realtime mode, through an audio library it dec
 a dependency, and needs none offline.
 
 **Timeouts.** In realtime mode the host MUST NOT block the device callback on a slow
-client; it skips the client's block (logging an xrun) and continues. A client waiting on
-`tick` for more than 1 s in realtime mode SHOULD treat the host as gone (§8).
+client; it skips the client's block (logging an xrun) and continues. What the client's
+consumers receive for that block is **silence** (decided 2026-09-15): a halted MCU's
+codec would keep clocking its last DMA buffer, but silence is the one thing nobody
+mistakes for a working app. A client waiting on `tick` for more than 1 s in realtime mode
+SHOULD treat the host as gone (§8).
 
 ## 6. Routing and conversion
 
@@ -212,23 +244,22 @@ Analog conversion per copy: `v = decode(src_code, src.electrical)`,
 `range_v`, `bits`, and `inverted` from the SHIMs. Digital and MIDI are copied unchanged.
 Fan-out is always allowed. An unpatched input holds its SHIM `idle_v`, encoded.
 
-*Proposal (2026-09-15) — gain and fan-in* (`sketchbook/bench-mixing.md`: "where is the
-mixing board?"). A route carries a `gain` (linear, default 1.0) and, for MIDI, an
-optional `channel` (1–16). The rules by kind:
+*Fan-in, revised after the review (2026-09-15; the first proposal made the host "most of
+a mixer" with per-route gain and audio summing, and Michael did not like that).* The
+host is a patch bay, not a desk: it copies and converts, never mixes. There is no
+per-route gain. Fan-in by kind:
 
-| Kind | Gain | Fan-in (several routes into one input) |
-|---|---|---|
-| audio | applied per copy, in float before `s24_rj_i32` | **summed** after gain, in float, then converted and clipped at the destination's full scale; the host logs a clip once per second per input |
-| analog | applied in volts before `encode` | **refused**: two CV outputs into one jack is a short on hardware; a bench that wants a sum patches a mixer app |
-| digital | none | **refused** for the same reason (an OR would be a rule the hardware does not have) |
-| midi | none | **merged**, whole messages only, running status written out per source — what sidecar's virmidi bus does today |
+| Kind | Fan-in (several routes into one input) |
+|---|---|
+| audio | **refused**. Summing is a Mixer app's job — `modules::Mixer` wrapped as an SBL app, patched like any module (`sketchbook/bench-mixing.md`). The bench's four voices go through one such app to the interface. |
+| analog | **refused**: two CV outputs into one jack is a short on hardware |
+| digital | **refused** for the same reason |
+| midi | **merged**, whole messages only, running status written out per source — a merge box is a cable's job, and it is what two controllers into one app need |
 
-The `midi_channel_filter` feature: a MIDI route with a `channel` passes only messages
-on that channel (System messages pass), so one output can fan out to four voices by
-channel — the bench's channel bus, moved into the host as an optional feature bit
-(Michael, AP-039 Q2). A host without the bit rejects a `channel` on `patch`, and
-sidecar keeps its own bus for that host. With audio gain and summing the host is a
-mixer without sends; sends and returns are a Mixer app's business, not the host's.
+Fan-out stays free for every kind. The `midi_channel_filter` feature (Michael, AP-039
+Q2): a MIDI route with a `channel` (1–16) passes only messages on that channel (System
+messages pass), so one output can fan out to four voices by channel — the bench's
+channel bus as a route filter. A host without the bit rejects a `channel` on `patch`.
 
 *Cross-kind routes* (feature `cross_kind_routes`; decided on the bench, Michael
 2026-09-10, no longer open): analog→digital is a Schmitt trigger, high at ≥ 1.0 V, low
@@ -253,7 +284,7 @@ no equivalent; their record is `constexpr`.
 - **Host exits or crashes.** The client's control socket reads EOF and `tick` reads fail.
   The driver MUST log one line naming the cause and terminate the process with a nonzero
   status. Continuing with frozen inputs is not permitted (RPT-031 §F7).
-- **Protocol error** (bad magic, version mismatch, unknown kind required). Whoever detects
+- **Protocol error** (bad signature, version mismatch, unknown kind required). Whoever detects
   it sends `bye {reason}` and closes.
 - **Liveness beyond fds.** The host MAY hold a `pidfd` for every attached app (works
   whether or not the host spawned it) and MAY set `PR_SET_PDEATHSIG` on apps it spawns.
@@ -279,8 +310,8 @@ knows nothing about how they were started.
 
 | Request | Response | Meaning |
 |---|---|---|
-| `{op: "list"}` | `{apps: [{name, pid, state, ports: [{id, kind, ...from the SHIM}]}], routes: [{src, dst, gain, channel}]}` | the rack as it stands |
-| `{op: "patch", src: "maestro.midi_out", dst: "voice1.midi_in", gain?, channel?}` | `{ok}` | a route, validated as §6 |
+| `{op: "list"}` | `{apps: [{name, pid, state, ports: [{id, kind, ...from the SHIM}]}], routes: [{src, dst, channel}]}` | the rack as it stands |
+| `{op: "patch", src: "maestro.midi_out", dst: "voice1.midi_in", channel?}` | `{ok}` | a route, validated as §6 |
 | `{op: "unpatch", src, dst}` | `{ok}` | |
 | `{op: "status"}` | `{mode, block_size, sample_rate, blocks, xruns: {app: n}, overflows: {app: n}, routes: [{src, dst, bytes, messages}]}` | the numbers the dashboard draws |
 | `{op: "read", app, port}` | `{value}` | one state port's current value, decoded to volts or 0/1: the dashboard's real gauges |
@@ -296,10 +327,6 @@ the virmidi taps and the PipeWire recorder gave it, from the host's own buffers.
 ## Open items
 
 - Multi-host on one machine: session-scoped socket paths are sufficient; not specified further.
-- **A stopped client in realtime mode** (a debugger holds it). The host skips its block
-  and logs; what do its consumers hear meanwhile? Proposal: silence. A halted MCU's codec
-  keeps clocking the last DMA buffer, so "repeat the last block" is the hardware-literal
-  answer, but silence is the one nobody mistakes for a working app.
 - **Control channel encoding.** Now a proposal in §2 (binary for clients, JSON for
   operators). The alternative — a header-only JSON parser confined to the host driver —
   stays on the table if the struct route reads badly.
