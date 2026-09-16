@@ -5,15 +5,14 @@ RPT-031 (sound-byte-labs) findings F3–F8, all accepted. Nothing here is implem
 
 > **Review guide (AP-039 Phase 2).** Blocks marked *Proposal* are Claude's, written from
 > what building the bench needed (FDP-079); each is a decision for Michael. In order of
-> consequence: (1) §5 the schedule (answers "why the one-block delay"); (2) §2 the
-> control-channel encoding — binary structs for the handshake, JSON for operators;
-> (3) §10 the operator API sidecar's daemon and any front end need; (4) §2 how a bench
-> names its host; (5) §6 whether MIDI merge and the channel filter stay in the host or
-> become a module. Decided so far (2026-09-15): attached only — no standalone driver
-> path; the host never spawns; the host never mixes (§6, fan-in refused for audio; a
-> Mixer app sums); the header field is `signature`; a stopped client's consumers hear
-> silence. Accepting a proposal means deleting the word *Proposal* from it; rejecting
-> one means saying what instead.
+> consequence: (1) §2 the control-channel encoding — binary structs for the handshake,
+> JSON for operators; (2) §10 the operator API sidecar's daemon and any front end need;
+> (3) §2 how a bench names its host. Decided (2026-09-15): attached only — no standalone
+> driver path; the schedule is pipelined, one block per hop; the host never spawns; the
+> host never mixes and never merges — fan-in refused for every kind, a Mixer app sums
+> audio and a MIDI utility app merges and splits; the header field is `signature`; a
+> stopped client's consumers hear silence. Accepting a proposal means deleting the word
+> *Proposal* from it; rejecting one means saying what instead.
 
 ## 1. Model
 
@@ -76,8 +75,8 @@ struct sbl_vdh_msg_hdr { char signature[4]; /* "SBLV" */ uint16_t version; /* 0 
 ```
 
 Features are a bit set in this encoding (§2 lists them by name in feature-bit order:
-`offline_clock` = bit 0, `port_config` = 1, `midi_out` = 2, `cross_kind_routes` = 3,
-`midi_channel_filter` = 4). A host that does not recognise the signature closes the socket.
+`offline_clock` = bit 0, `port_config` = 1, `midi_out` = 2, `cross_kind_routes` = 3).
+A host that does not recognise the signature closes the socket.
 
 *Proposal (2026-09-15) — naming a host.* `SBL_VDH` is the whole of discovery. Whoever
 starts apps (sidecar, a script, a shell) sets it in their environment; a bench that
@@ -100,8 +99,8 @@ either → other  bye      {reason}
 - `shim_sha256` is the hash of the SHIM the app was built with. The host already has the
   SHIM (from launch or from `attach --shim`); a mismatch is a hard `bye`.
 - `features` are strings (bits in the binary encoding). v0 defines: `offline_clock`,
-  `port_config`, `midi_out`, `cross_kind_routes`, and — *Proposal (2026-09-15)* —
-  `midi_channel_filter` (§6). A client MUST NOT use a feature the host did not ack.
+  `port_config`, `midi_out`, `cross_kind_routes`. A client MUST NOT use a feature the
+  host did not ack.
 - Each `regions[]` entry: `{kind, ports: [id...], fd_index, size}`. Kinds are listed in §4.
   A client MUST accept regions in any order and MAY ignore kinds it does not drive.
 - The host MUST NOT tick a client before `ready` (virtio: no buffers before `DRIVER_OK`).
@@ -180,19 +179,20 @@ MSB-justified serial frame (RM0433 Rev 8 §51.4.5, p. 2242).
 The host is the clock master. Each client gets two eventfds: `tick` (host → client) and
 `done` (client → host).
 
-*Proposal (2026-09-15, answering the review's question "what is the reason for the one
-block delay?").* The earlier text described two different schedules at once. A **serial
-walk** — tick app A, wait, copy its output to B, tick B, wait — adds no latency along a
-forward route but runs the apps one after another, so the sum of every app's block time
-must fit one period: four Davis Jr. voices at ~37 % of a core each cannot. A
-**pipelined** schedule ticks every app at once, each consuming what its sources produced
-on the previous block: apps run in parallel on separate cores, the host's work per block
-is copies only, and every hop costs exactly one block of latency (1 ms at 48 frames, a
-chain of four adds 4 ms), which JACK and PipeWire avoid by running the whole graph inside
-one period but which is what makes the schedule deterministic with no ordering rule at
-all. The one-block delay is the price of running five apps on four cores in real time
-and of a render that is bit-exact whatever the machine. The proposal is the pipelined
-schedule, and the walk becomes:
+**The schedule is pipelined** (decided, Michael 2026-09-15): every app is ticked at once,
+each consuming what its sources published for the previous block. Every hop between
+apps therefore costs one block of latency — 1 ms at 48 frames; the bench's chain of
+Maestro, a voice and a mixer adds about 3 ms on top of the interface's own ~6 ms — and
+that is a consequence of the simplest host that runs five apps on four cores, not a
+goal. The alternatives, for the record: a serial walk (tick A, wait, copy to B, tick B)
+adds no hop latency but runs apps one after another, so the sum of their block times
+must fit one period, which four Davis Jr. voices at ~37 % of a core cannot; a wave
+schedule (JACK2's) runs independent branches in parallel and chains serially, with no
+forward-hop latency and a one-block delay only on cycles, at the price of a topological
+sort per patch change. Waves is a contained upgrade if a long chain ever matters — the
+clients see the same `tick` and `done` either way — and the render is bit-exact under
+every one of them. A hardware rack of digital modules has the pipelined shape already:
+each module runs its own block. Per block the host:
 
 1. Copy every route — state (ADC/GPIO/DAC) and stream (audio, MIDI) — from what each
    source published for the previous block. Fan-in and conversion are §6.
@@ -253,12 +253,14 @@ per-route gain. Fan-in by kind:
 | audio | **refused**. Summing is a Mixer app's job — `modules::Mixer` wrapped as an SBL app, patched like any module (`sketchbook/bench-mixing.md`). The bench's four voices go through one such app to the interface. |
 | analog | **refused**: two CV outputs into one jack is a short on hardware |
 | digital | **refused** for the same reason |
-| midi | **merged**, whole messages only, running status written out per source — a merge box is a cable's job, and it is what two controllers into one app need |
+| midi | **refused** (decided, Michael 2026-09-15): a MIDI cable carries one jack to another, and a merge box is a module you buy |
 
-Fan-out stays free for every kind. The `midi_channel_filter` feature (Michael, AP-039
-Q2): a MIDI route with a `channel` (1–16) passes only messages on that channel (System
-messages pass), so one output can fan out to four voices by channel — the bench's
-channel bus as a route filter. A host without the bit rejects a `channel` on `patch`.
+Fan-out stays free for every kind. MIDI merging (two controllers into one app) and
+channel filtering or splitting (one controller to four voices by channel) are a small
+utility app — merge in, split or filter out by channel, thru — patched like any module,
+not features of the host; the earlier `midi_channel_filter` feature is withdrawn. With
+per-app ports the bench no longer needs a channel bus at all: Maestro gets its four
+outputs back (FDP-078's first drawing), one route per voice.
 
 *Cross-kind routes* (feature `cross_kind_routes`; decided on the bench, Michael
 2026-09-10, no longer open): analog→digital is a Schmitt trigger, high at ≥ 1.0 V, low
@@ -309,8 +311,8 @@ knows nothing about how they were started.
 
 | Request | Response | Meaning |
 |---|---|---|
-| `{op: "list"}` | `{apps: [{name, pid, state, ports: [{id, kind, ...from the SHIM}]}], routes: [{src, dst, channel}]}` | the rack as it stands |
-| `{op: "patch", src: "maestro.midi_out", dst: "voice1.midi_in", channel?}` | `{ok}` | a route, validated as §6 |
+| `{op: "list"}` | `{apps: [{name, pid, state, ports: [{id, kind, ...from the SHIM}]}], routes: [{src, dst}]}` | the rack as it stands |
+| `{op: "patch", src: "maestro.midi_out_1", dst: "voice1.midi_in"}` | `{ok}` | a route, validated as §6 |
 | `{op: "unpatch", src, dst}` | `{ok}` | |
 | `{op: "status"}` | `{mode, block_size, sample_rate, blocks, xruns: {app: n}, overflows: {app: n}, routes: [{src, dst, bytes, messages}]}` | the numbers the dashboard draws |
 | `{op: "read", app, port}` | `{value}` | one state port's current value, decoded to volts or 0/1: the dashboard's real gauges |
