@@ -10,7 +10,7 @@ RPT-031 (sound-byte-labs) findings F3–F8, all accepted. Nothing here is implem
 > control-channel encoding — binary structs for the handshake, JSON for operators;
 > (4) §10 the operator API sidecar's daemon and any front end need; (5) §2 how a bench
 > names its host. Folded from the first review (2026-09-15): the host never spawns, the
-> host never mixes (§6, fan-in refused for audio; a Mixer app sums), `signature` not
+> host never mixes (§6, fan-in refused for audio; a Mixer app sums), the header field is
 > `signature`, a stopped client's consumers hear silence. Accepting a proposal means deleting
 > the word *Proposal* from it; rejecting one means saying what instead.
 
