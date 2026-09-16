@@ -56,6 +56,20 @@ For audio, when `audio` is not null: `in`, `out` (channel counts), `sample_rate`
 `block_size`, and `format` (`s24_rj_i32`). An app whose `audio` is null declares no
 audio ports and the host MUST NOT wait on its `done`.
 
+**Audio inputs** (decided 2026-09-15, Michael; not yet generated — Phase 3 builds it).
+An app has one audio output, `audio_out`, and one or more audio inputs, named the way
+MIDI outputs are: `audio_in` for one, `audio_in_1`..`audio_in_n` for several. The count
+comes from `app.sbl.json` (`audio: { in: n }`, default 1), and `audio.inputs` in the
+SHIM carries it. Every input has the codec's `in` channel count, `sample_rate` and
+`block_size`, so a route's shape check (`protocol.md` §6) is per port and a stereo voice
+patches into any one input of a four-input Mixer. A host assigns one `AUDIO_IN` region
+per input port by id; the client audio driver presents them to the app callback as
+`inputs × in` input planes in port order, so a Mixer app reads `in[2 * i]`, `in[2 * i + 1]`
+for its i-th stereo input. The alternative — one wide region and a channel offset in
+`patch` — was rejected: it puts arithmetic in the host's patch call that the SHIM can
+declare. On hardware a codec offers one input; an app declaring more is a host app
+until a panel has more jacks.
+
 ## MIDI ports
 
 MIDI ports are declared by the app (`app.sbl.json`, `midi: {in, out, thru}`), not by the

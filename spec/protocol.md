@@ -235,7 +235,7 @@ A route is `(src_app, src_port) → (dst_app, dst_port)`. The host validates on 
 |---|---|
 | kinds | `analog_out→analog_in`, `digital_out→digital_in`, `audio_out→audio_in`, `midi_out→midi_in` only, unless `cross_kind_routes` is acked |
 | direction | outputs feed inputs; never in→in or out→out |
-| audio shape | `sample_rate` and `channel_count` must match |
+| audio shape | `sample_rate` and `channel_count` must match, per port — a Mixer's inputs each have the codec's channel count |
 | range | analog: allowed; the host warns when the source range exceeds the destination's and **clips** at the destination's rails, as hardware would |
 
 Analog conversion per copy: `v = decode(src_code, src.electrical)`,
@@ -250,7 +250,7 @@ per-route gain. Fan-in by kind:
 
 | Kind | Fan-in (several routes into one input) |
 |---|---|
-| audio | **refused**. Summing is a Mixer app's job — `modules::Mixer` wrapped as an SBL app, patched like any module (`sketchbook/bench-mixing.md`). The bench's four voices go through one such app to the interface. |
+| audio | **refused**. Summing is a Mixer app's job — `modules::Mixer` wrapped as an SBL app, patched like any module (`sketchbook/bench-mixing.md`). The bench's four voices go through one such app to the interface, each into its own input: an app declares several audio inputs, `audio_in_1`..`audio_in_n`, one region each (`shim.md`, audio inputs; decided 2026-09-15). |
 | analog | **refused**: two CV outputs into one jack is a short on hardware |
 | digital | **refused** for the same reason |
 | midi | **refused** (decided, Michael 2026-09-15): a MIDI cable carries one jack to another, and a merge box is a module you buy |
