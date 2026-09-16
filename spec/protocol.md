@@ -5,14 +5,15 @@ RPT-031 (sound-byte-labs) findings F3–F8, all accepted. Nothing here is implem
 
 > **Review guide (AP-039 Phase 2).** Blocks marked *Proposal* are Claude's, written from
 > what building the bench needed (FDP-079); each is a decision for Michael. In order of
-> consequence: (1) §2 attached only — no standalone driver path (answers the review's
-> question); (2) §5 the pipelined schedule (answers "why the one-block delay"); (3) §2 the
+> consequence: (1) §5 the schedule (answers "why the one-block delay"); (2) §2 the
 > control-channel encoding — binary structs for the handshake, JSON for operators;
-> (4) §10 the operator API sidecar's daemon and any front end need; (5) §2 how a bench
-> names its host. Folded from the first review (2026-09-15): the host never spawns, the
-> host never mixes (§6, fan-in refused for audio; a Mixer app sums), the header field is
-> `signature`, a stopped client's consumers hear silence. Accepting a proposal means deleting
-> the word *Proposal* from it; rejecting one means saying what instead.
+> (3) §10 the operator API sidecar's daemon and any front end need; (4) §2 how a bench
+> names its host; (5) §6 whether MIDI merge and the channel filter stay in the host or
+> become a module. Decided so far (2026-09-15): attached only — no standalone driver
+> path; the host never spawns; the host never mixes (§6, fan-in refused for audio; a
+> Mixer app sums); the header field is `signature`; a stopped client's consumers hear
+> silence. Accepting a proposal means deleting the word *Proposal* from it; rejecting
+> one means saying what instead.
 
 ## 1. Model
 
@@ -40,20 +41,18 @@ no virtqueues (https://qemu.readthedocs.io/en/master/interop/vhost-user.html).
 
 - `SBL_VDH=<path>` — a Unix domain socket the host listens on.
 
-*Proposal (2026-09-15, answering the review's question "what are the downsides of
-requiring a VDH?") — attached only.* Today every `linux-arm-host` driver has a standalone
-path (miniaudio, rawmidi, idle counts) and would gain an attached one: two paths in four
-drivers, forever, and the kind of drift the golden render exists to catch. Requiring the
-host removes the standalone path entirely: the drivers do one thing, miniaudio and
-rawmidi move into the host (which needs them for real-time mode anyway), and
-`usb_stubs.cpp`'s rawmidi bridge is deleted rather than kept beside its replacement.
-The downsides are real but small: nothing runs on Linux until the host exists, so the
-client drivers and the reference host land in one phase and the bench stays on virmidi
-until they do; the quick check (`SBL_AUDIO_DEVICE=H5studio ./davis_jr`) becomes
-`vdh --solo ./davis_jr`, a host that patches one app's audio and MIDI straight to the
-interface, which is what `sidecar new -a` already means; and CI always needs the host,
-which it needs for the render regardless. Under this proposal an app with `SBL_VDH`
-unset logs one line and exits nonzero, the same rule as a host that goes away (§8).
+**Attached only** (decided, Michael 2026-09-15). A `linux-arm-host` app has no standalone
+path: with `SBL_VDH` unset the driver logs one line and exits nonzero, the same rule as
+a host that goes away (§8). The reasoning: a standalone path (miniaudio, rawmidi, idle
+counts) beside an attached one is two paths in four drivers, forever, and the kind of
+drift the golden render exists to catch. Miniaudio and rawmidi live in the host, which
+needs them for real-time mode anyway; `usb_stubs.cpp`'s rawmidi bridge is deleted rather
+than kept beside its replacement. Consequences: the client drivers and the reference
+host land in one phase, the bench stays on virmidi until they do, the quick check
+(`SBL_AUDIO_DEVICE=H5studio ./davis_jr`) becomes `vdh --solo ./davis_jr` — a host that
+patches one app's audio and MIDI straight to the interface, which is what
+`sidecar new -a` already means — and CI always needs the host, which it needs for the
+render regardless.
 - The **control channel** is that socket, with file descriptors passed via `SCM_RIGHTS`
   where noted. The data path never touches it.
 
