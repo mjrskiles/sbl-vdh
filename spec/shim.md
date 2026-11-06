@@ -5,8 +5,7 @@ drive or read, by the name the app's own code uses. sloth generates it from the 
 resolution that produces the app's C++ config headers, and the build copies it next to
 the binary as `<target>.shim.json`. Its schema is owned by `sbl-schema` in sound-byte-libs
 (`shim.schema.json`, exported from `models/shim.py`, ADR-006); this document states what
-a host needs from it. Anything the schema has that this document does not name is
-documentation for people, not contract.
+a host needs from it.
 
 ## Document
 
